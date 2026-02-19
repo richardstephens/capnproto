@@ -520,6 +520,12 @@ struct MaybeTraits<Own<T, D>> {
   // Allow Maybe<Own<T>> -> Maybe<T&> via dereference.
   // This enables: void foo(Maybe<T&> b); foo(maybeOwn);
   static constexpr bool dereferencingConversion = true;
+
+  // Own<T>'s destructor can trigger cascading destructions in intrusive data structures
+  // (e.g., linked lists of Own<T>) that reentrantly assign to the same Maybe. Deferring the old
+  // value's destruction until after the new value is in place ensures reentrant accesses see a
+  // valid state.
+  static constexpr bool reentrantAssignment = true;
 };
 
 namespace _ {  // private

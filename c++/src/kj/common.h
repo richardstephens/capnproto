@@ -1197,6 +1197,21 @@ struct MaybeTraits {
   // The conversion will work for any U& that *T can convert to. For example, if T is Own<X>,
   // then *T returns X&, which can convert to Base& if X derives from Base.
   // This also handles const: if Maybe<T> is const, it converts to Maybe<const U&>.
+  //
+  // REENTRANT ASSIGNMENT: To make Maybe<T>'s assignment operators and emplace() safe against
+  // T's destructor reentrantly accessing the enclosing Maybe, define:
+  //   static constexpr bool reentrantAssignment = true;
+  // This requires T to have a noexcept move constructor (a static_assert enforces this).
+  //
+  // When enabled, assignment and emplace defer destruction of the old value until after the new
+  // value is in place, so any reentrant access from the old value's destructor sees the new value.
+  // This matters for ownership types in intrusive data structures, where destroying one node can
+  // trigger cascading operations that assign to the same Maybe (e.g., unlinking from an intrusive
+  // linked list of Own<T>).
+  //
+  // When NOT enabled, it is undefined behavior for T's destructor to access the enclosing Maybe
+  // during assignment or emplace. (And regardless of this flag, it is always undefined behavior
+  // for T's destructor to mutate the enclosing Maybe during regular destruction of the Maybe.)
 };
 
 namespace _ {  // private
@@ -1229,6 +1244,12 @@ concept HasDereferencingConversionFlag =
     requires { { MaybeTraits<T>::dereferencingConversion } -> SameAs<const bool&>; } &&
     MaybeTraits<T>::dereferencingConversion;
 // Concept: MaybeTraits<T>::dereferencingConversion exists and is true
+
+template <typename T>
+concept HasReentrantAssignmentFlag =
+    requires { { MaybeTraits<T>::reentrantAssignment } -> SameAs<const bool&>; } &&
+    MaybeTraits<T>::reentrantAssignment;
+// Concept: MaybeTraits<T>::reentrantAssignment exists and is true
 
 template <typename T, typename U>
 concept DerefConvertsTo = HasDereferencingConversionFlag<T> && requires(T& t) {
@@ -1694,7 +1715,7 @@ public:
   Maybe(T&& t): ptr(kj::mv(t)) {}
   Maybe(T& t): ptr(t) {}
   Maybe(const T& t): ptr(t) {}
-  Maybe(Maybe&& other): ptr(kj::mv(other.ptr)) { other = kj::none; }
+  Maybe(Maybe&& other): ptr(kj::mv(other.ptr)) { other.ptr = nullptr; }
   Maybe(const Maybe& other): ptr(other.ptr) {}
   Maybe(Maybe& other): ptr(other.ptr) {}
 
@@ -1751,7 +1772,14 @@ public:
     // T's constructor. This can be used to initialize a Maybe without copying or even moving a T.
     // Returns a reference to the newly-constructed value.
 
-    return ptr.emplace(kj::fwd<Params>(params)...);
+    if constexpr (kDeferOldValue) {
+      // Move the old value (if any) into a local so that its destructor runs at scope exit,
+      // AFTER the new value has been emplaced. See comment on assignment operators below.
+      Maybe self(kj::mv(*this));
+      return ptr.emplace(kj::fwd<Params>(params)...);
+    } else {
+      return ptr.emplace(kj::fwd<Params>(params)...);
+    }
   }
 
   // All assignment operators below are implemented by first extracting `other`'s value to a
@@ -1761,68 +1789,124 @@ public:
   //    extracted before `this` is destroyed, so we don't access freed memory.
   // 2. If the extraction throws, `this` is unchanged.
   // 3. If emplace() throws, `this` is left in the none state (emplace has exception safety).
+  //
+  // When kDeferOldValue is true (T has a noexcept move constructor), we additionally use
+  // `Maybe self(kj::mv(*this))` to move the old destination value into a local that is destroyed
+  // at scope exit, AFTER the new value has been emplaced. This ensures that if the old value's
+  // destructor reentrantly accesses `*this` (e.g., cascading destructions in an intrusive linked
+  // list like workerd's io-own.c++), it sees the new value rather than a partially-destroyed state.
 
   inline Maybe& operator=(T&& other) {
-    T temp(kj::mv(other));
-    ptr.emplace(kj::mv(temp));
+    T sourceTemp(kj::mv(other));
+    if constexpr (kDeferOldValue) {
+      Maybe self(kj::mv(*this));
+      ptr.emplace(kj::mv(sourceTemp));
+    } else {
+      ptr.emplace(kj::mv(sourceTemp));
+    }
     return *this;
   }
   inline Maybe& operator=(T& other) {
-    T temp(other);
-    ptr.emplace(kj::mv(temp));
+    T sourceTemp(other);
+    if constexpr (kDeferOldValue) {
+      Maybe self(kj::mv(*this));
+      ptr.emplace(kj::mv(sourceTemp));
+    } else {
+      ptr.emplace(kj::mv(sourceTemp));
+    }
     return *this;
   }
   inline Maybe& operator=(const T& other) {
-    T temp(other);
-    ptr.emplace(kj::mv(temp));
+    T sourceTemp(other);
+    if constexpr (kDeferOldValue) {
+      Maybe self(kj::mv(*this));
+      ptr.emplace(kj::mv(sourceTemp));
+    } else {
+      ptr.emplace(kj::mv(sourceTemp));
+    }
     return *this;
   }
 
   inline Maybe& operator=(Maybe&& other) {
-    Maybe temp(kj::mv(other));
-    KJ_IF_SOME(value, kj::mv(temp)) {
-      ptr.emplace(kj::mv(value));
+    Maybe sourceTemp(kj::mv(other));
+    if constexpr (kDeferOldValue) {
+      Maybe self(kj::mv(*this));
+      KJ_IF_SOME(value, kj::mv(sourceTemp)) {
+        ptr.emplace(kj::mv(value));
+      }
     } else {
-      *this = kj::none;
+      KJ_IF_SOME(value, kj::mv(sourceTemp)) {
+        ptr.emplace(kj::mv(value));
+      } else {
+        ptr = nullptr;
+      }
     }
     return *this;
   }
   inline Maybe& operator=(Maybe& other) {
-    Maybe temp(other);
-    KJ_IF_SOME(value, temp) {
-      ptr.emplace(kj::mv(value));
+    Maybe sourceTemp(other);
+    if constexpr (kDeferOldValue) {
+      Maybe self(kj::mv(*this));
+      KJ_IF_SOME(value, kj::mv(sourceTemp)) {
+        ptr.emplace(kj::mv(value));
+      }
     } else {
-      *this = kj::none;
+      KJ_IF_SOME(value, kj::mv(sourceTemp)) {
+        ptr.emplace(kj::mv(value));
+      } else {
+        ptr = nullptr;
+      }
     }
     return *this;
   }
   inline Maybe& operator=(const Maybe& other) {
-    Maybe temp(other);
-    KJ_IF_SOME(value, temp) {
-      ptr.emplace(kj::mv(value));
+    Maybe sourceTemp(other);
+    if constexpr (kDeferOldValue) {
+      Maybe self(kj::mv(*this));
+      KJ_IF_SOME(value, kj::mv(sourceTemp)) {
+        ptr.emplace(kj::mv(value));
+      }
     } else {
-      *this = kj::none;
+      KJ_IF_SOME(value, kj::mv(sourceTemp)) {
+        ptr.emplace(kj::mv(value));
+      } else {
+        ptr = nullptr;
+      }
     }
     return *this;
   }
 
   template <typename U>
   Maybe& operator=(Maybe<U>&& other) {
-    Maybe temp(kj::mv(other));
-    KJ_IF_SOME(value, kj::mv(temp)) {
-      ptr.emplace(kj::mv(value));
+    Maybe sourceTemp(kj::mv(other));
+    if constexpr (kDeferOldValue) {
+      Maybe self(kj::mv(*this));
+      KJ_IF_SOME(value, kj::mv(sourceTemp)) {
+        ptr.emplace(kj::mv(value));
+      }
     } else {
-      *this = kj::none;
+      KJ_IF_SOME(value, kj::mv(sourceTemp)) {
+        ptr.emplace(kj::mv(value));
+      } else {
+        ptr = nullptr;
+      }
     }
     return *this;
   }
   template <typename U>
   Maybe& operator=(const Maybe<U>& other) {
-    Maybe temp(other);
-    KJ_IF_SOME(value, kj::mv(temp)) {
-      ptr.emplace(kj::mv(value));
+    Maybe sourceTemp(other);
+    if constexpr (kDeferOldValue) {
+      Maybe self(kj::mv(*this));
+      KJ_IF_SOME(value, kj::mv(sourceTemp)) {
+        ptr.emplace(kj::mv(value));
+      }
     } else {
-      *this = kj::none;
+      KJ_IF_SOME(value, kj::mv(sourceTemp)) {
+        ptr.emplace(kj::mv(value));
+      } else {
+        ptr = nullptr;
+      }
     }
     return *this;
   }
@@ -1831,8 +1915,13 @@ public:
     requires _::HasConvertingConstructorFlag<T> &&  // Only when MaybeTraits<T> opts in
              requires(U&& u) { T(kj::fwd<U>(u)); }
   Maybe& operator=(U&& value) {
-    T temp(kj::fwd<U>(value));
-    ptr.emplace(kj::mv(temp));
+    T sourceTemp(kj::fwd<U>(value));
+    if constexpr (kDeferOldValue) {
+      Maybe self(kj::mv(*this));
+      ptr.emplace(kj::mv(sourceTemp));
+    } else {
+      ptr.emplace(kj::mv(sourceTemp));
+    }
     return *this;
   }
   // Converting assignment: allows assigning a U that is convertible to T.
@@ -1843,12 +1932,26 @@ public:
   // explanation.
 
   KJ_DEPRECATE_EMPTY_MAYBE_FROM_NULLPTR_ATTR
-  inline Maybe& operator=(decltype(nullptr)) { ptr = nullptr; return *this; }
+  inline Maybe& operator=(decltype(nullptr)) {
+    if constexpr (kDeferOldValue) {
+      Maybe self(kj::mv(*this));
+    } else {
+      ptr = nullptr;
+    }
+    return *this;
+  }
 
   KJ_DEPRECATE_EMPTY_MAYBE_FROM_NULLPTR_ATTR
   inline bool operator==(decltype(nullptr)) const { return ptr == nullptr; }
 
-  inline Maybe& operator=(kj::None) { ptr = nullptr; return *this; }
+  inline Maybe& operator=(kj::None) {
+    if constexpr (kDeferOldValue) {
+      Maybe self(kj::mv(*this));
+    } else {
+      ptr = nullptr;
+    }
+    return *this;
+  }
   inline bool operator==(kj::None) const { return ptr == nullptr; }
 
   inline bool operator==(const Maybe<T>& other) const {
@@ -2016,6 +2119,23 @@ public:
 
 private:
   _::NullableValue<T> ptr;
+
+  // True when MaybeTraits<T>::reentrantAssignment is defined and true, enabling the
+  // reentrancy-safe pattern of moving the old value into a local `Maybe self(kj::mv(*this))` so
+  // that the old value's destructor runs at scope exit (after the new value is in place).
+  //
+  // We require a noexcept move constructor to avoid regressing exception safety. We check noexcept
+  // via placement new (via _::PlacementNew) rather than `requires { { T(T&&) } noexcept; }`
+  // because the latter also considers the destructor's noexcept specification when evaluating the
+  // full expression. This matters for types like Own<T> whose move constructor is noexcept but
+  // whose destructor is noexcept(false). The outer `requires` clause makes the placement-new
+  // expression SFINAE-friendly for types with deleted move constructors.
+  static constexpr bool kDeferOldValue = _::HasReentrantAssignmentFlag<T>;
+  static constexpr bool kHasNoexceptMoveCtor = requires {
+    { new (kj::instance<T*>(), _::PlacementNew()) T(kj::instance<T&&>()) } noexcept;
+  };
+  static_assert(!kDeferOldValue || kHasNoexceptMoveCtor,
+      "MaybeTraits<T>::reentrantAssignment requires T to have a noexcept move constructor");
 
   template <typename U>
   friend class Maybe;
