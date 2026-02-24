@@ -253,6 +253,18 @@ public:
   template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
   TestPtr(TestPtr<U>&& other): ptr(other.ptr) { other.ptr = nullptr; }
 
+  // Converting assignment: TestPtr<U> -> TestPtr<T> when U* converts to T*.
+  // Own<T> doesn't have this, but we add it here to test Maybe's delegation path for
+  // operator=(U&&) when T has a converting assignment operator.
+  template <typename U, typename = EnableIf<canConvert<U*, T*>()>>
+  TestPtr& operator=(TestPtr<U>&& other) {
+    T* old = ptr;
+    ptr = other.ptr;
+    other.ptr = nullptr;
+    delete old;
+    return *this;
+  }
+
   KJ_DISALLOW_COPY(TestPtr);
 
   T* get() const { return ptr; }
@@ -830,9 +842,20 @@ KJ_TEST("Maybe convertingConstructor enables implicit two-step conversion") {
     KJ_EXPECT(KJ_ASSERT_NONNULL(m)->value == 123);
   }
 
-  // Assignment from TestPtr<Derived> to Maybe<TestPtr<Base>>
+  // Assignment from TestPtr<Derived> to Maybe<TestPtr<Base>> (empty Maybe)
   {
     Maybe<TestPtr<Base>> m;
+    m = TestPtr<Derived>(new Derived(99));
+    KJ_EXPECT(m != kj::none);
+    KJ_EXPECT(KJ_ASSERT_NONNULL(m)->value == 99);
+  }
+
+  // Assignment from TestPtr<Derived> to Maybe<TestPtr<Base>> (valueful Maybe)
+  // This exercises the delegation path in operator=(U&&): since TestPtr<Base> has
+  // operator=(TestPtr<Derived>&&), Maybe delegates to it via `*ptr = kj::fwd<U>(value)`.
+  {
+    Maybe<TestPtr<Base>> m = TestPtr<Base>(new Base(42));
+    KJ_EXPECT(KJ_ASSERT_NONNULL(m)->value == 42);
     m = TestPtr<Derived>(new Derived(99));
     KJ_EXPECT(m != kj::none);
     KJ_EXPECT(KJ_ASSERT_NONNULL(m)->value == 99);
@@ -1620,7 +1643,9 @@ KJ_TEST("Maybe<Own<T>> copy-assignment is safe when this owns other") {
         next = heap<CopyableNode>(*n);
       }
     }
-    CopyableNode& operator=(const CopyableNode&) = default;
+    CopyableNode& operator=(const CopyableNode&) = delete;
+    // CopyableNode is copy-constructible (deep copy) but not copy-assignable, because the default
+    // copy-assignment for Maybe<Own<CopyableNode>> can't copy Own<CopyableNode>.
   };
 
   Maybe<CopyableNode> head = CopyableNode(1);
@@ -1674,14 +1699,17 @@ KJ_TEST("Maybe<T> T-value copy-assignment is safe when this owns other") {
         next = heap<Node>(*n);
       }
     }
-    Node& operator=(const Node&) = default;
+    Node& operator=(const Node&) = delete;
+    // Node is copy-constructible (deep copy) but not copy-assignable, because the default
+    // copy-assignment for Maybe<Own<Node>> can't copy Own<Node>.
   };
 
   // Create a Maybe that owns a Node, which owns another Node
   Maybe<Node> head = Node(1);
   KJ_ASSERT_NONNULL(head).next = heap<Node>(2);
 
-  // Copy-assign from the inner Node to head
+  // Copy-assign from the inner Node to head. Node isn't copy-assignable, so Maybe falls back to
+  // copy-constructing a temporary then emplacing.
   KJ_IF_SOME(node, head) {
     KJ_IF_SOME(next, node.next) {
       head = *next;  // operator=(const T&) where T is inside head's value
@@ -1799,6 +1827,16 @@ struct EventLoggerNiche {
     if (other.id != 0) events[eventCount++] = other.id + 100;
     other.id = 0;  // Must zero for niche sentinel.
   }
+  EventLoggerNiche& operator=(EventLoggerNiche&& other) noexcept {
+    // Event encoding for move-assignment:
+    //   -(old_id)      = old value replaced
+    //   +(new_id+200)  = move-assigned from this id
+    if (id != 0) events[eventCount++] = -id;
+    id = other.id;
+    if (other.id != 0) events[eventCount++] = other.id + 200;
+    other.id = 0;
+    return *this;
+  }
   KJ_DISALLOW_COPY(EventLoggerNiche);
 
   ~EventLoggerNiche() {
@@ -1819,7 +1857,6 @@ template <>
 struct MaybeTraits<EventLoggerNiche> {
   static void initNone(EventLoggerNiche* ptr) noexcept { kj::ctor(*ptr, 0); }
   static bool isNone(const EventLoggerNiche& m) noexcept { return m.id == 0; }
-  static constexpr bool reentrantAssignment = true;
 };
 
 namespace {
@@ -1848,6 +1885,21 @@ struct EventLoggerNonNiche {
     if (other.id != 0) events[eventCount++] = other.id + 100;
     other.movedFrom = true;  // Don't zero id — keep it for dtor identification.
   }
+  EventLoggerNonNiche& operator=(EventLoggerNonNiche&& other) noexcept {
+    // Event encoding for move-assignment:
+    //   -(old_id)      = old value replaced (or -(old_id+100) if was moved-from)
+    //   +(new_id+200)  = move-assigned from this id
+    if (movedFrom) {
+      events[eventCount++] = -(id + 100);
+    } else if (id != 0) {
+      events[eventCount++] = -id;
+    }
+    id = other.id;
+    movedFrom = other.movedFrom;
+    if (other.id != 0) events[eventCount++] = other.id + 200;
+    other.movedFrom = true;
+    return *this;
+  }
   KJ_DISALLOW_COPY(EventLoggerNonNiche);
 
   ~EventLoggerNonNiche() {
@@ -1866,15 +1918,13 @@ int EventLoggerNonNiche::eventCount = 0;
 
 template <>
 struct MaybeTraits<EventLoggerNonNiche> {
-  static constexpr bool reentrantAssignment = true;
 };
 
 namespace {
 
-// ----------- Non-deferred event loggers (kDeferOldValue = false) -----------
-// No reentrantAssignment trait, so these types exercise the non-deferred code path,
-// where NullableValue::emplace() destroys the old value BEFORE constructing the new one.
-// The move constructor is intentionally not noexcept, preventing opt-in to reentrantAssignment.
+// ----------- Event loggers without move-assignment operators -----------
+// These types have a throwing (non-noexcept) move constructor and no move-assignment operator.
+// For Maybe::operator=(T&&), the `if constexpr` falls through to emplace (destroy + construct).
 
 struct NonDeferredLoggerNiche {
   int id;
@@ -1938,9 +1988,8 @@ struct NonDeferredLoggerNonNiche {
 int NonDeferredLoggerNonNiche::events[20] = {};
 int NonDeferredLoggerNonNiche::eventCount = 0;
 
-// ----------- Immobile event loggers (kDeferOldValue = false) -----------
-// No reentrantAssignment trait, and no move or copy constructors.
-// Only emplace() works; assignment operators are not usable.
+// ----------- Immobile event loggers -----------
+// No move or copy constructors. Only emplace() works; assignment operators are not usable.
 
 struct ImmobileLoggerNiche {
   int id;
@@ -1997,59 +2046,54 @@ int ImmobileLoggerNonNiche::events[20] = {};
 int ImmobileLoggerNonNiche::eventCount = 0;
 
 // ===========================================================================
-// Event ordering tests: noexcept-move types (kDeferOldValue = true)
+// Event ordering tests: types with move-assignment operators
 //
-// These tests verify the deferred destruction pattern. With kDeferOldValue, the old value is
-// moved to a local `Maybe self(kj::mv(*this))` so its destructor runs AFTER the new value is
-// emplaced. Move construction now logs events (id+100), making these tests discriminating:
-// they would FAIL if the deferred pattern were removed.
+// These tests verify the delegation pattern. When both source and destination are valueful,
+// Maybe delegates to T's own assignment operator. T is responsible for safely handling the
+// transition, including reentrancy from T's destructor.
+//
+// emplace() does NOT defer destruction — the old value is destroyed BEFORE the new value is
+// constructed. operator=(kj::none) similarly just destroys the old value directly.
 //
 // Event encoding (see EventLoggerNiche/NonNiche comments for details):
 //   +id       = explicit construction
 //   +(id+100) = move construction from value with this id
-//   -id       = destruction of live value
+//   +(id+200) = move-assigned from value with this id
+//   -id       = destruction of live value (or replacement in assignment)
 //   -(id+100) = destruction of moved-from value (non-niche only; niche moved-from is silent)
 // ===========================================================================
 
-KJ_TEST("Maybe emplace: old value destroyed AFTER new value constructed (niche)") {
+KJ_TEST("Maybe emplace: old value destroyed BEFORE new constructed (niche)") {
   EventLoggerNiche::eventCount = 0;
 
   Maybe<EventLoggerNiche> m;
   m.emplace(1);
   EventLoggerNiche::eventCount = 0;
 
-  // emplace(2) with deferred:
-  //   Maybe self(kj::mv(*this)) → move old T(1) → logs 101, source.id=0
-  //   ptr.emplace(2)            → ctor(2)        → logs 2
-  //   scope exit: self dtor     → dtor of T(1)   → logs -1
+  // emplace(2): no deferred destruction.
+  //   ptr.emplace(2) → destroy old T(1) → logs -1, then construct T(2) → logs 2
   m.emplace(2);
-  KJ_ASSERT(EventLoggerNiche::eventCount == 3);
-  KJ_EXPECT(EventLoggerNiche::events[0] == 101, "expected move:1");
-  KJ_EXPECT(EventLoggerNiche::events[1] == 2,   "expected ctor:2");
-  KJ_EXPECT(EventLoggerNiche::events[2] == -1,  "expected dtor:1");
+  KJ_ASSERT(EventLoggerNiche::eventCount == 2);
+  KJ_EXPECT(EventLoggerNiche::events[0] == -1, "expected dtor:1");
+  KJ_EXPECT(EventLoggerNiche::events[1] == 2,  "expected ctor:2");
 }
 
-KJ_TEST("Maybe emplace: old value destroyed AFTER new value constructed (non-niche)") {
+KJ_TEST("Maybe emplace: old value destroyed BEFORE new constructed (non-niche)") {
   EventLoggerNonNiche::eventCount = 0;
 
   Maybe<EventLoggerNonNiche> m;
   m.emplace(1);
   EventLoggerNonNiche::eventCount = 0;
 
-  // emplace(2) with deferred:
-  //   Maybe self(kj::mv(*this)) → move old T(1) → logs 101
-  //     other.ptr=nullptr        → dtor moved-from T(1)    → logs -101
-  //   ptr.emplace(2)             → ctor(2)                  → logs 2
-  //   scope exit: self dtor      → dtor of live T(1)        → logs -1
+  // emplace(2): no deferred destruction.
+  //   ptr.emplace(2) → destroy old T(1) → logs -1, then construct T(2) → logs 2
   m.emplace(2);
-  KJ_ASSERT(EventLoggerNonNiche::eventCount == 4);
-  KJ_EXPECT(EventLoggerNonNiche::events[0] == 101,  "expected move:1");
-  KJ_EXPECT(EventLoggerNonNiche::events[1] == -101, "expected moved-from dtor:1");
-  KJ_EXPECT(EventLoggerNonNiche::events[2] == 2,    "expected ctor:2");
-  KJ_EXPECT(EventLoggerNonNiche::events[3] == -1,   "expected dtor:1");
+  KJ_ASSERT(EventLoggerNonNiche::eventCount == 2);
+  KJ_EXPECT(EventLoggerNonNiche::events[0] == -1, "expected dtor:1");
+  KJ_EXPECT(EventLoggerNonNiche::events[1] == 2,  "expected ctor:2");
 }
 
-KJ_TEST("Maybe operator=(T&&): old value destroyed AFTER new emplaced (niche)") {
+KJ_TEST("Maybe operator=(T&&): delegates to T's move-assignment (niche)") {
   EventLoggerNiche::eventCount = 0;
 
   Maybe<EventLoggerNiche> m;
@@ -2057,19 +2101,14 @@ KJ_TEST("Maybe operator=(T&&): old value destroyed AFTER new emplaced (niche)") 
   EventLoggerNiche::eventCount = 0;
 
   // m = EventLoggerNiche(2):
-  //   temporary ctor(2)                            → logs 2
-  //   sourceTemp = move(temp)                      → logs 102, temp.id=0
-  //   Maybe self(kj::mv(*this)) → move T(1)       → logs 101, source.id=0
-  //   ptr.emplace(kj::mv(sourceTemp)) → move T(2) → logs 102, sourceTemp.id=0
-  //   scope exit: self dtor → dtor of live T(1)    → logs -1
-  //   (sourceTemp id=0: silent; temp id=0: silent)
+  //   temporary ctor(2)                       → logs 2
+  //   *ptr = kj::mv(temp) → T's move-assign  → logs -1 (replace old), 202 (assign-from:2)
+  //   temp dtor: temp.id=0                    → silent (niche sentinel)
   m = EventLoggerNiche(2);
-  KJ_ASSERT(EventLoggerNiche::eventCount == 5);
+  KJ_ASSERT(EventLoggerNiche::eventCount == 3);
   KJ_EXPECT(EventLoggerNiche::events[0] == 2,   "expected temp ctor:2");
-  KJ_EXPECT(EventLoggerNiche::events[1] == 102, "expected move temp→sourceTemp");
-  KJ_EXPECT(EventLoggerNiche::events[2] == 101, "expected move old→self");
-  KJ_EXPECT(EventLoggerNiche::events[3] == 102, "expected move sourceTemp→emplace");
-  KJ_EXPECT(EventLoggerNiche::events[4] == -1,  "expected old dtor:1");
+  KJ_EXPECT(EventLoggerNiche::events[1] == -1,  "expected replace old:1");
+  KJ_EXPECT(EventLoggerNiche::events[2] == 202, "expected assign-from:2");
   KJ_IF_SOME(val, m) {
     KJ_EXPECT(val.id == 2, val.id);
   } else {
@@ -2077,7 +2116,7 @@ KJ_TEST("Maybe operator=(T&&): old value destroyed AFTER new emplaced (niche)") 
   }
 }
 
-KJ_TEST("Maybe operator=(T&&): old value destroyed AFTER new emplaced (non-niche)") {
+KJ_TEST("Maybe operator=(T&&): delegates to T's move-assignment (non-niche)") {
   EventLoggerNonNiche::eventCount = 0;
 
   Maybe<EventLoggerNonNiche> m;
@@ -2085,24 +2124,15 @@ KJ_TEST("Maybe operator=(T&&): old value destroyed AFTER new emplaced (non-niche
   EventLoggerNonNiche::eventCount = 0;
 
   // m = EventLoggerNonNiche(2):
-  //   temporary ctor(2)                              → logs 2
-  //   sourceTemp = move(temp)                        → logs 102, temp.movedFrom=true
-  //   Maybe self(kj::mv(*this)) → move T(1)         → logs 101, source.movedFrom=true
-  //     other.ptr=nullptr → dtor moved-from T(1)     → logs -101
-  //   ptr.emplace(kj::mv(sourceTemp)) → move T(2)   → logs 102, sourceTemp.movedFrom=true
-  //   scope exit: self dtor → dtor live T(1)         → logs -1
-  //   sourceTemp dtor: movedFrom=true                → logs -102
-  //   temp dtor: movedFrom=true                      → logs -102
+  //   temporary ctor(2)                       → logs 2
+  //   *ptr = kj::mv(temp) → T's move-assign  → logs -1 (replace old), 202 (assign-from:2)
+  //   temp dtor: movedFrom=true               → logs -102
   m = EventLoggerNonNiche(2);
-  KJ_ASSERT(EventLoggerNonNiche::eventCount == 8);
+  KJ_ASSERT(EventLoggerNonNiche::eventCount == 4);
   KJ_EXPECT(EventLoggerNonNiche::events[0] == 2,    "expected temp ctor:2");
-  KJ_EXPECT(EventLoggerNonNiche::events[1] == 102,  "expected move temp→sourceTemp");
-  KJ_EXPECT(EventLoggerNonNiche::events[2] == 101,  "expected move old→self");
-  KJ_EXPECT(EventLoggerNonNiche::events[3] == -101, "expected moved-from dtor:1");
-  KJ_EXPECT(EventLoggerNonNiche::events[4] == 102,  "expected move sourceTemp→emplace");
-  KJ_EXPECT(EventLoggerNonNiche::events[5] == -1,   "expected old dtor:1");
-  KJ_EXPECT(EventLoggerNonNiche::events[6] == -102, "expected sourceTemp moved-from dtor");
-  KJ_EXPECT(EventLoggerNonNiche::events[7] == -102, "expected temp moved-from dtor");
+  KJ_EXPECT(EventLoggerNonNiche::events[1] == -1,   "expected replace old:1");
+  KJ_EXPECT(EventLoggerNonNiche::events[2] == 202,  "expected assign-from:2");
+  KJ_EXPECT(EventLoggerNonNiche::events[3] == -102, "expected temp moved-from dtor");
   KJ_IF_SOME(val, m) {
     KJ_EXPECT(val.id == 2, val.id);
   } else {
@@ -2110,7 +2140,7 @@ KJ_TEST("Maybe operator=(T&&): old value destroyed AFTER new emplaced (non-niche
   }
 }
 
-KJ_TEST("Maybe operator=(Maybe&&) with value: old destroyed AFTER new emplaced (niche)") {
+KJ_TEST("Maybe operator=(Maybe&&) with value: delegates to T's move-assignment (niche)") {
   EventLoggerNiche::eventCount = 0;
 
   Maybe<EventLoggerNiche> m;
@@ -2120,19 +2150,15 @@ KJ_TEST("Maybe operator=(Maybe&&) with value: old destroyed AFTER new emplaced (
   EventLoggerNiche::eventCount = 0;
 
   // m = kj::mv(other):
-  //   sourceTemp = Maybe(kj::mv(other)) → move T(2)                 → logs 102
-  //   Maybe self(kj::mv(*this)) → move T(1)                         → logs 101
-  //   KJ_IF_SOME auto _unique = NV(kj::mv(sourceTemp.ptr)) → move T(2) → logs 102
-  //   ptr.emplace(kj::mv(value)) → move T(2)                        → logs 102
-  //   scope exit: self dtor → dtor live T(1)                         → logs -1
-  //   (all moved-from niche values have id=0: silent)
+  //   sourceTemp = Maybe(kj::mv(other)) → move T(2)                   → logs 102
+  //   sourceTemp.ptr != nullptr, ptr != nullptr
+  //   *ptr = kj::mv(*sourceTemp.ptr) → T's move-assign → logs -1 (replace), 202 (assign-from:2)
+  //   sourceTemp dtor: inner id=0                                      → silent
   m = kj::mv(other);
-  KJ_ASSERT(EventLoggerNiche::eventCount == 5);
+  KJ_ASSERT(EventLoggerNiche::eventCount == 3);
   KJ_EXPECT(EventLoggerNiche::events[0] == 102, "expected move other→sourceTemp");
-  KJ_EXPECT(EventLoggerNiche::events[1] == 101, "expected move old→self");
-  KJ_EXPECT(EventLoggerNiche::events[2] == 102, "expected move sourceTemp→KJ_IF_SOME");
-  KJ_EXPECT(EventLoggerNiche::events[3] == 102, "expected move KJ_IF_SOME→emplace");
-  KJ_EXPECT(EventLoggerNiche::events[4] == -1,  "expected old dtor:1");
+  KJ_EXPECT(EventLoggerNiche::events[1] == -1,  "expected replace old:1");
+  KJ_EXPECT(EventLoggerNiche::events[2] == 202, "expected assign-from:2");
   KJ_IF_SOME(val, m) {
     KJ_EXPECT(val.id == 2, val.id);
   } else {
@@ -2140,7 +2166,7 @@ KJ_TEST("Maybe operator=(Maybe&&) with value: old destroyed AFTER new emplaced (
   }
 }
 
-KJ_TEST("Maybe operator=(Maybe&&) with value: old destroyed AFTER new emplaced (non-niche)") {
+KJ_TEST("Maybe operator=(Maybe&&) with value: delegates to T's move-assignment (non-niche)") {
   EventLoggerNonNiche::eventCount = 0;
 
   Maybe<EventLoggerNonNiche> m;
@@ -2150,29 +2176,19 @@ KJ_TEST("Maybe operator=(Maybe&&) with value: old destroyed AFTER new emplaced (
   EventLoggerNonNiche::eventCount = 0;
 
   // m = kj::mv(other):
-  //   sourceTemp = Maybe(kj::mv(other)) → move T(2)              → logs 102
-  //     other.ptr=nullptr → dtor moved-from T(2)                  → logs -102
-  //   Maybe self(kj::mv(*this)) → move T(1)                      → logs 101
-  //     this->ptr=nullptr → dtor moved-from T(1)                  → logs -101
-  //   KJ_IF_SOME: _unique = NV(kj::mv(sourceTemp.ptr)) → move T(2) → logs 102
-  //     (sourceTemp.ptr inner movedFrom=true)
-  //   ptr.emplace(kj::mv(value)) → move T(2)                     → logs 102
-  //     (_unique inner movedFrom=true)
-  //   scope exit:
-  //     _unique dtor: movedFrom=true                              → logs -102
-  //     self dtor: live T(1)                                      → logs -1
-  //     sourceTemp dtor: movedFrom=true                           → logs -102
+  //   Maybe sourceTemp(kj::mv(other)):
+  //     NullableValue move-ctor: move T(2)              → logs 102
+  //     other.ptr = nullptr → dtor moved-from T(2)      → logs -102
+  //   sourceTemp.ptr != nullptr, ptr != nullptr
+  //   *ptr = kj::mv(*sourceTemp.ptr) → T's move-assign → logs -1 (replace), 202 (assign-from:2)
+  //   sourceTemp dtor: inner movedFrom=true             → logs -102
   m = kj::mv(other);
-  KJ_ASSERT(EventLoggerNonNiche::eventCount == 9);
+  KJ_ASSERT(EventLoggerNonNiche::eventCount == 5);
   KJ_EXPECT(EventLoggerNonNiche::events[0] == 102,  "expected move other→sourceTemp");
   KJ_EXPECT(EventLoggerNonNiche::events[1] == -102, "expected other moved-from dtor");
-  KJ_EXPECT(EventLoggerNonNiche::events[2] == 101,  "expected move old→self");
-  KJ_EXPECT(EventLoggerNonNiche::events[3] == -101, "expected old moved-from dtor");
-  KJ_EXPECT(EventLoggerNonNiche::events[4] == 102,  "expected move sourceTemp→KJ_IF_SOME");
-  KJ_EXPECT(EventLoggerNonNiche::events[5] == 102,  "expected move KJ_IF_SOME→emplace");
-  KJ_EXPECT(EventLoggerNonNiche::events[6] == -102, "expected KJ_IF_SOME moved-from dtor");
-  KJ_EXPECT(EventLoggerNonNiche::events[7] == -1,   "expected old dtor:1");
-  KJ_EXPECT(EventLoggerNonNiche::events[8] == -102, "expected sourceTemp moved-from dtor");
+  KJ_EXPECT(EventLoggerNonNiche::events[2] == -1,   "expected replace old:1");
+  KJ_EXPECT(EventLoggerNonNiche::events[3] == 202,  "expected assign-from:2");
+  KJ_EXPECT(EventLoggerNonNiche::events[4] == -102, "expected sourceTemp moved-from dtor");
   KJ_IF_SOME(val, m) {
     KJ_EXPECT(val.id == 2, val.id);
   } else {
@@ -2180,7 +2196,7 @@ KJ_TEST("Maybe operator=(Maybe&&) with value: old destroyed AFTER new emplaced (
   }
 }
 
-KJ_TEST("Maybe operator=(Maybe&&) with none: old destroyed via deferred dtor (niche)") {
+KJ_TEST("Maybe operator=(Maybe&&) with none: old value destroyed directly (niche)") {
   EventLoggerNiche::eventCount = 0;
 
   Maybe<EventLoggerNiche> m;
@@ -2190,17 +2206,14 @@ KJ_TEST("Maybe operator=(Maybe&&) with none: old destroyed via deferred dtor (ni
 
   // m = kj::mv(empty):
   //   sourceTemp = Maybe(kj::mv(empty)) → empty, no events
-  //   Maybe self(kj::mv(*this)) → move T(1)     → logs 101
-  //   KJ_IF_SOME: _unique from sourceTemp → empty, no events; body not entered
-  //   scope exit: self dtor → dtor live T(1)     → logs -1
+  //   sourceTemp.ptr == nullptr → ptr = nullptr → destroy old T(1) → logs -1
   m = kj::mv(empty);
-  KJ_ASSERT(EventLoggerNiche::eventCount == 2);
-  KJ_EXPECT(EventLoggerNiche::events[0] == 101, "expected move old→self");
-  KJ_EXPECT(EventLoggerNiche::events[1] == -1,  "expected old dtor:1");
+  KJ_ASSERT(EventLoggerNiche::eventCount == 1);
+  KJ_EXPECT(EventLoggerNiche::events[0] == -1, "expected dtor:1");
   KJ_EXPECT(m == kj::none);
 }
 
-KJ_TEST("Maybe operator=(Maybe&&) with none: old destroyed via deferred dtor (non-niche)") {
+KJ_TEST("Maybe operator=(Maybe&&) with none: old value destroyed directly (non-niche)") {
   EventLoggerNonNiche::eventCount = 0;
 
   Maybe<EventLoggerNonNiche> m;
@@ -2210,19 +2223,14 @@ KJ_TEST("Maybe operator=(Maybe&&) with none: old destroyed via deferred dtor (no
 
   // m = kj::mv(empty):
   //   sourceTemp = Maybe(kj::mv(empty)) → empty, no events
-  //   Maybe self(kj::mv(*this)) → move T(1)        → logs 101
-  //     this->ptr=nullptr → dtor moved-from T(1)    → logs -101
-  //   KJ_IF_SOME: _unique from sourceTemp → empty; body not entered
-  //   scope exit: self dtor → dtor live T(1)        → logs -1
+  //   sourceTemp.ptr == nullptr → ptr = nullptr → destroy old T(1) → logs -1
   m = kj::mv(empty);
-  KJ_ASSERT(EventLoggerNonNiche::eventCount == 3);
-  KJ_EXPECT(EventLoggerNonNiche::events[0] == 101,  "expected move old→self");
-  KJ_EXPECT(EventLoggerNonNiche::events[1] == -101, "expected old moved-from dtor");
-  KJ_EXPECT(EventLoggerNonNiche::events[2] == -1,   "expected old dtor:1");
+  KJ_ASSERT(EventLoggerNonNiche::eventCount == 1);
+  KJ_EXPECT(EventLoggerNonNiche::events[0] == -1, "expected dtor:1");
   KJ_EXPECT(m == kj::none);
 }
 
-KJ_TEST("Maybe operator=(kj::None): old destroyed via deferred dtor (niche)") {
+KJ_TEST("Maybe operator=(kj::None): old value destroyed directly (niche)") {
   EventLoggerNiche::eventCount = 0;
 
   Maybe<EventLoggerNiche> m;
@@ -2230,17 +2238,14 @@ KJ_TEST("Maybe operator=(kj::None): old destroyed via deferred dtor (niche)") {
   EventLoggerNiche::eventCount = 0;
 
   // m = kj::none:
-  //   Maybe self(kj::mv(*this)) → move T(1)     → logs 101
-  //   scope exit: self dtor → dtor live T(1)     → logs -1
-  // Without deferred, we'd only see [-1]. The move event proves deferred happened.
+  //   ptr = nullptr → destroy old T(1) → logs -1
   m = kj::none;
-  KJ_ASSERT(EventLoggerNiche::eventCount == 2);
-  KJ_EXPECT(EventLoggerNiche::events[0] == 101, "expected move old→self");
-  KJ_EXPECT(EventLoggerNiche::events[1] == -1,  "expected old dtor:1");
+  KJ_ASSERT(EventLoggerNiche::eventCount == 1);
+  KJ_EXPECT(EventLoggerNiche::events[0] == -1, "expected dtor:1");
   KJ_EXPECT(m == kj::none);
 }
 
-KJ_TEST("Maybe operator=(kj::None): old destroyed via deferred dtor (non-niche)") {
+KJ_TEST("Maybe operator=(kj::None): old value destroyed directly (non-niche)") {
   EventLoggerNonNiche::eventCount = 0;
 
   Maybe<EventLoggerNonNiche> m;
@@ -2248,23 +2253,18 @@ KJ_TEST("Maybe operator=(kj::None): old destroyed via deferred dtor (non-niche)"
   EventLoggerNonNiche::eventCount = 0;
 
   // m = kj::none:
-  //   Maybe self(kj::mv(*this)) → move T(1)        → logs 101
-  //     this->ptr=nullptr → dtor moved-from T(1)    → logs -101
-  //   scope exit: self dtor → dtor live T(1)        → logs -1
-  // Without deferred, we'd only see [-1]. The move event proves deferred happened.
+  //   ptr = nullptr → destroy old T(1) → logs -1
   m = kj::none;
-  KJ_ASSERT(EventLoggerNonNiche::eventCount == 3);
-  KJ_EXPECT(EventLoggerNonNiche::events[0] == 101,  "expected move old→self");
-  KJ_EXPECT(EventLoggerNonNiche::events[1] == -101, "expected old moved-from dtor");
-  KJ_EXPECT(EventLoggerNonNiche::events[2] == -1,   "expected old dtor:1");
+  KJ_ASSERT(EventLoggerNonNiche::eventCount == 1);
+  KJ_EXPECT(EventLoggerNonNiche::events[0] == -1, "expected dtor:1");
   KJ_EXPECT(m == kj::none);
 }
 
 // ===========================================================================
-// Event ordering tests: types without reentrantAssignment (kDeferOldValue = false)
+// Event ordering tests: types without move-assignment operators
 //
-// The move constructor is not noexcept, so the deferred pattern is not used.
-// NullableValue::emplace() destroys the old value BEFORE constructing the new one.
+// These types have a throwing (non-noexcept) move constructor and no move-assignment operator.
+// For operator=(T&&), Maybe falls back to emplace (destroy + construct).
 // ===========================================================================
 
 KJ_TEST("Maybe emplace: non-deferred type, old destroyed BEFORE new constructed (niche)") {
@@ -2294,9 +2294,9 @@ KJ_TEST("Maybe emplace: non-deferred type, old destroyed BEFORE new constructed 
 }
 
 // ===========================================================================
-// Event ordering tests: immobile types without reentrantAssignment (kDeferOldValue = false)
+// Event ordering tests: immobile types (no move/copy constructors)
 //
-// No move or copy constructors, so only emplace() is testable.
+// Only emplace() is testable; assignment operators are not available.
 // NullableValue::emplace() destroys the old value BEFORE constructing the new one.
 // ===========================================================================
 
@@ -2360,24 +2360,22 @@ KJ_TEST("Maybe<Own<T>> operator=(T&&): old value's destructor sees new value") {
   // Create a node whose destructor will check what m contains.
   m = kj::heap<ReentrantDestructor>(1, &m, &observedId);
 
-  // Assign a new value. The old node's destructor should see the NEW value in m.
+  // Assign a new value. Maybe delegates to Own's move-assignment, which saves the old pointer,
+  // takes the new pointer, then disposes the old. The old node's destructor sees the new value.
   m = kj::heap<ReentrantDestructor>(2);
-
-  // With the fix: old node (id=1) is moved to a local, new node (id=2) is emplaced, then old
-  // node is destroyed at scope exit. Its destructor reads m and sees id=2.
-  // Without the fix: old node is destroyed by emplace() while still "inside" the Maybe —
-  // its destructor would see stale or invalid state.
   KJ_EXPECT(observedId == 2, observedId);
 }
 
-KJ_TEST("Maybe<Own<T>> emplace: old value's destructor sees new value") {
+KJ_TEST("Maybe<Own<T>> emplace: old value's destructor sees empty Maybe") {
   int observedId = 0;
   Maybe<Own<ReentrantDestructor>> m;
 
   m = kj::heap<ReentrantDestructor>(1, &m, &observedId);
 
+  // emplace() destroys the old value BEFORE constructing the new one (no deferred destruction).
+  // The old node's destructor runs while the Maybe is cleared, so it sees an empty Maybe.
   m.emplace(kj::heap<ReentrantDestructor>(2));
-  KJ_EXPECT(observedId == 2, observedId);
+  KJ_EXPECT(observedId == -1, observedId);
 }
 
 KJ_TEST("Maybe<Own<T>> operator=(kj::none): old value's destructor sees empty Maybe") {
@@ -2386,7 +2384,7 @@ KJ_TEST("Maybe<Own<T>> operator=(kj::none): old value's destructor sees empty Ma
 
   m = kj::heap<ReentrantDestructor>(1, &m, &observedId);
 
-  // Clear via kj::none. Old node's destructor should see m as empty.
+  // Clear via kj::none. The old node's destructor sees m as empty.
   m = kj::none;
   KJ_EXPECT(observedId == -1, observedId);
 }
@@ -2399,6 +2397,8 @@ KJ_TEST("Maybe<Own<T>> move-assignment from other Maybe: old value's destructor 
   m = kj::heap<ReentrantDestructor>(1, &m, &observedId);
   other = kj::heap<ReentrantDestructor>(2);
 
+  // Maybe extracts source into sourceTemp, then delegates to Own's move-assignment.
+  // Own saves old pointer, takes new, disposes old. Old node's destructor sees the new value.
   m = kj::mv(other);
   KJ_EXPECT(observedId == 2, observedId);
 }
