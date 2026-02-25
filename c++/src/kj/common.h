@@ -1296,9 +1296,6 @@ public:
   template <typename... Params>
   inline T& emplace(Params&&... params) {
     destroy();
-    // NOLINTNEXTLINE(clang-analyzer-core.uninitialized.Assign) - false positive when
-    // Maybe::operator=(Maybe&&) is called with self-assignment: the analyzer loses track of the
-    // fact that sourceTemp's union storage is a separate object from *this's.
     ctor(value, kj::fwd<Params>(params)...);
     isSet = true;
     return value;
@@ -1340,9 +1337,79 @@ public:
   }
   inline NullableValue(decltype(nullptr)): isSet(false) {}
 
-  // Note: Assignment operators (except nullptr) are intentionally not provided here.
-  // Maybe<T> implements its own assignment operators that are safe against the case where
-  // `this` owns `other` (e.g., head = kj::mv(head->next) in a linked list).
+  // Note: Move/copy assignment operators delegate to T's own assignment operators when possible,
+  // but do NOT handle the case where `other` is inside `*this`'s value (e.g.,
+  // head = kj::mv(head->next)). Maybe<T>'s assignment operators handle that by extracting the
+  // source into a temporary before calling these.
+
+  inline NullableValue& operator=(NullableValue&& other) {
+    if (other.isSet) {
+      if constexpr (requires(T& a, T&& b) { a = kj::mv(b); }) {
+        if (isSet) {
+          value = kj::mv(other.value);
+        } else {
+          ctor(value, kj::mv(other.value));
+          isSet = true;
+        }
+      } else {
+        destroy();
+        ctor(value, kj::mv(other.value));
+        isSet = true;
+      }
+    } else {
+      destroy();
+    }
+    return *this;
+  }
+  inline NullableValue& operator=(const NullableValue& other) {
+    if (other.isSet) {
+      if constexpr (requires(T& a, T&& b) { a = kj::mv(b); }) {
+        // Copy into a local, then move-assign. This is both exception-safe (if copy throws,
+        // *this is unchanged) and equivalent to what T's copy-assignment would likely do.
+        T sourceTemp(other.value);
+        if (isSet) {
+          value = kj::mv(sourceTemp);
+        } else {
+          ctor(value, kj::mv(sourceTemp));
+          isSet = true;
+        }
+      } else {
+        destroy();
+        ctor(value, other.value);
+        isSet = true;
+      }
+    } else {
+      destroy();
+    }
+    return *this;
+  }
+  inline NullableValue& operator=(NullableValue& other) {
+    // Non-const lvalue: delegate to const version.
+    return *this = static_cast<const NullableValue&>(other);
+  }
+
+  template <typename U = T>
+    requires requires(U&& u) { T(kj::fwd<U>(u)); }
+  inline NullableValue& operator=(U&& other) {
+    // Assign from a value. The isSet guard here is directly visible to the analyzer,
+    // avoiding false positives that arise when the guard is in an outer class (Maybe).
+    if constexpr (requires(T& a, U&& b) { a = kj::fwd<U>(b); }) {
+      if (isSet) {
+        value = kj::fwd<U>(other);
+      } else {
+        ctor(value, kj::fwd<U>(other));
+        isSet = true;
+      }
+    } else {
+      // T has no assignment from U; fall back to destroy + construct.
+      // Extract into a temporary first, in case `other` is inside *this's value.
+      T sourceTemp(kj::fwd<U>(other));
+      destroy();
+      ctor(value, kj::mv(sourceTemp));
+      isSet = true;
+    }
+    return *this;
+  }
 
   inline NullableValue& operator=(decltype(nullptr)) {
     destroy();
@@ -1358,7 +1425,6 @@ public:
 
 private:
   KJ_ALWAYS_INLINE(void destroy()) {
-    // NOLINTNEXTLINE(clang-analyzer-core.uninitialized.Branch) - clang-tidy is confused
     if (isSet) {
       isSet = false;
       dtor(value);
@@ -1490,9 +1556,103 @@ public:
 
   inline NullableValue(decltype(nullptr)) { initNone(&value); }
 
-  // Note: Assignment operators (except nullptr) are intentionally not provided here.
-  // Maybe<T> implements its own assignment operators that are safe against the case where
-  // `this` owns `other` (e.g., head = kj::mv(head->next) in a linked list).
+  // Note: Move/copy assignment operators delegate to T's own assignment operators when possible,
+  // but do NOT handle the case where `other` is inside `*this`'s value (e.g.,
+  // head = kj::mv(head->next)). Maybe<T>'s assignment operators handle that by extracting the
+  // source into a temporary before calling these.
+
+  inline NullableValue& operator=(NullableValue&& other) {
+    if (!isNone(other.value)) {
+      if constexpr (requires(T& a, T&& b) { a = kj::mv(b); }) {
+        if (!isNone(value)) {
+          value = kj::mv(other.value);
+        } else {
+          ctor(value, kj::mv(other.value));
+        }
+      } else {
+        // No move-assignment; destroy + construct.
+        // Exception safety: if dtor or ctor throws, leave in none state.
+        try {
+          if (!isNone(value)) dtor(value);
+          ctor(value, kj::mv(other.value));
+        } catch (...) {
+          initNone(&value);  // noexcept
+          throw;
+        }
+      }
+    } else {
+      // Source is none; destroy *this if set.
+      if (!isNone(value)) {
+        try {
+          dtor(value);
+        } catch (...) {
+          initNone(&value);  // noexcept
+          throw;
+        }
+        initNone(&value);
+      }
+    }
+    return *this;
+  }
+  inline NullableValue& operator=(const NullableValue& other) {
+    if (!isNone(other.value)) {
+      if constexpr (requires(T& a, T&& b) { a = kj::mv(b); }) {
+        T sourceTemp(other.value);
+        if (!isNone(value)) {
+          value = kj::mv(sourceTemp);
+        } else {
+          ctor(value, kj::mv(sourceTemp));
+        }
+      } else {
+        try {
+          if (!isNone(value)) dtor(value);
+          ctor(value, other.value);
+        } catch (...) {
+          initNone(&value);  // noexcept
+          throw;
+        }
+      }
+    } else {
+      if (!isNone(value)) {
+        try {
+          dtor(value);
+        } catch (...) {
+          initNone(&value);  // noexcept
+          throw;
+        }
+        initNone(&value);
+      }
+    }
+    return *this;
+  }
+  inline NullableValue& operator=(NullableValue& other) {
+    return *this = static_cast<const NullableValue&>(other);
+  }
+
+  template <typename U = T>
+    requires requires(U&& u) { T(kj::fwd<U>(u)); }
+  inline NullableValue& operator=(U&& other) {
+    if constexpr (requires(T& a, U&& b) { a = kj::fwd<U>(b); }) {
+      if (!isNone(value)) {
+        value = kj::fwd<U>(other);
+      } else {
+        ctor(value, kj::fwd<U>(other));
+      }
+    } else {
+      // T has no assignment from U; fall back to destroy + construct.
+      // Extract into a temporary first, in case `other` is inside *this's value.
+      // Exception safety: if dtor or ctor throws, leave in none state.
+      T sourceTemp(kj::fwd<U>(other));
+      try {
+        if (!isNone(value)) dtor(value);
+        ctor(value, kj::mv(sourceTemp));
+      } catch (...) {
+        initNone(&value);  // noexcept
+        throw;
+      }
+    }
+    return *this;
+  }
 
   inline NullableValue& operator=(decltype(nullptr)) {
     // Never destroy none values - they are trivially destructible sentinels.
@@ -1788,65 +1948,21 @@ public:
   // T's assignment operator instead (e.g., assign a new value, or use T's own nulling operation).
 
   inline Maybe& operator=(T&& other) {
-    if constexpr (requires(T& a, T&& b) { a = kj::mv(b); }) {
-      if (ptr != nullptr) {
-        // Delegate to T's own move-assignment. No temporary needed: T is responsible for safely
-        // handling reentrancy and the case where `other` is inside *this's value.
-        *ptr = kj::mv(other);
-      } else {
-        // *this is empty, so there is no old value to destroy and no risk that `other` is inside
-        // *this's value. No temporary needed.
-        ptr.emplace(kj::mv(other));
-      }
-    } else {
-      // TODO(cleanup): Require T to provide a move-assignment operator in order to use Maybe's
-      // assignment operators. Types that lack one (like kj::Exception) would only be assignable via
-      // emplace(). This would let us remove this fallback path entirely.
-
-      // T has no move-assignment operator; fall back to destroy + construct.
-      // Move into a temporary first for two reasons:
-      // 1. `other` might be inside *this's value (e.g., an Exception attached via detail array).
-      // 2. Exception safety: if move-construction throws, *this is unchanged.
-      T sourceTemp(kj::mv(other));
-      ptr.emplace(kj::mv(sourceTemp));
-    }
+    // Delegate to NullableValue::operator=(T&&). No temporary needed: T is responsible for safely
+    // handling reentrancy and the case where `other` is inside *this's value.
+    ptr = kj::mv(other);
     return *this;
   }
   inline Maybe& operator=(T& other) {
-    // Copy into a temporary first, then move-assign or emplace from it.
-    //
-    // Unlike the move-assignment operator, we don't try to delegate to T's copy-assignment
-    // operator. We could, in principle: if T has a copy-assignment operator, we could call
-    // `*ptr = other` directly and let T handle aliasing (just as we let T handle aliasing for
-    // move-assignment). But when T lacks copy-assignment, the fallback needs a sourceTemp anyway,
-    // and then we'd also need to branch on whether T has move-assignment — leading to nested
-    // branching for little benefit. Creating a sourceTemp unconditionally is simpler and has
-    // negligible overhead: it's the same copy that T's copy-assignment would likely do internally
-    // (e.g., copy-and-swap).
+    // Copy into a temporary first for exception safety, then move into NullableValue.
     T sourceTemp(other);
-    if constexpr (requires(T& a, T&& b) { a = kj::mv(b); }) {
-      if (ptr != nullptr) {
-        *ptr = kj::mv(sourceTemp);
-      } else {
-        ptr.emplace(kj::mv(sourceTemp));
-      }
-    } else {
-      ptr.emplace(kj::mv(sourceTemp));
-    }
+    ptr = kj::mv(sourceTemp);
     return *this;
   }
   inline Maybe& operator=(const T& other) {
-    // See operator=(T&) for rationale on the unconditional sourceTemp.
+    // Copy into a temporary first for exception safety, then move into NullableValue.
     T sourceTemp(other);
-    if constexpr (requires(T& a, T&& b) { a = kj::mv(b); }) {
-      if (ptr != nullptr) {
-        *ptr = kj::mv(sourceTemp);
-      } else {
-        ptr.emplace(kj::mv(sourceTemp));
-      }
-    } else {
-      ptr.emplace(kj::mv(sourceTemp));
-    }
+    ptr = kj::mv(sourceTemp);
     return *this;
   }
 
@@ -1854,94 +1970,35 @@ public:
     // Extract source into a temporary first. The source Maybe might live inside *this's value
     // (e.g., head = kj::mv(head->next)), so we must extract before touching *this.
     Maybe sourceTemp(kj::mv(other));
-    if (sourceTemp.ptr != nullptr) {
-      if constexpr (requires(T& a, T&& b) { a = kj::mv(b); }) {
-        if (ptr != nullptr) {
-          *ptr = kj::mv(*sourceTemp.ptr);
-        } else {
-          ptr.emplace(kj::mv(*sourceTemp.ptr));
-        }
-      } else {
-        ptr.emplace(kj::mv(*sourceTemp.ptr));
-      }
-    } else {
-      ptr = nullptr;
-    }
+    ptr = kj::mv(sourceTemp.ptr);
     return *this;
   }
   inline Maybe& operator=(Maybe& other) {
     // Copy into a temporary for exception safety: if the copy throws, *this is unchanged.
     Maybe sourceTemp(other);
-    if (sourceTemp.ptr != nullptr) {
-      if constexpr (requires(T& a, T&& b) { a = kj::mv(b); }) {
-        if (ptr != nullptr) {
-          *ptr = kj::mv(*sourceTemp.ptr);
-        } else {
-          ptr.emplace(kj::mv(*sourceTemp.ptr));
-        }
-      } else {
-        ptr.emplace(kj::mv(*sourceTemp.ptr));
-      }
-    } else {
-      ptr = nullptr;
-    }
+    ptr = kj::mv(sourceTemp.ptr);
     return *this;
   }
   inline Maybe& operator=(const Maybe& other) {
     // Copy into a temporary for exception safety: if the copy throws, *this is unchanged.
     Maybe sourceTemp(other);
-    if (sourceTemp.ptr != nullptr) {
-      if constexpr (requires(T& a, T&& b) { a = kj::mv(b); }) {
-        if (ptr != nullptr) {
-          *ptr = kj::mv(*sourceTemp.ptr);
-        } else {
-          ptr.emplace(kj::mv(*sourceTemp.ptr));
-        }
-      } else {
-        ptr.emplace(kj::mv(*sourceTemp.ptr));
-      }
-    } else {
-      ptr = nullptr;
-    }
+    ptr = kj::mv(sourceTemp.ptr);
     return *this;
   }
 
   template <typename U>
   Maybe& operator=(Maybe<U>&& other) {
-    // Extract source as Maybe<U> to preserve the original type for T::operator=(U&&).
-    Maybe<U> sourceTemp(kj::mv(other));
-    if (sourceTemp.ptr != nullptr) {
-      if constexpr (requires(T& a, U&& b) { a = kj::mv(b); }) {
-        if (ptr != nullptr) {
-          *ptr = kj::mv(*sourceTemp.ptr);
-        } else {
-          ptr.emplace(kj::mv(*sourceTemp.ptr));
-        }
-      } else {
-        ptr.emplace(kj::mv(*sourceTemp.ptr));
-      }
-    } else {
-      ptr = nullptr;
-    }
+    // Convert U→T via Maybe's converting move constructor, then delegate to NullableValue.
+    // The source Maybe might live inside *this's value, so we must extract before touching *this.
+    Maybe sourceTemp(kj::mv(other));
+    ptr = kj::mv(sourceTemp.ptr);
     return *this;
   }
   template <typename U>
   Maybe& operator=(const Maybe<U>& other) {
     // Convert U→T upfront (can't copy a Maybe<U> if U is non-copyable like Own or String).
     Maybe sourceTemp(other);
-    if (sourceTemp.ptr != nullptr) {
-      if constexpr (requires(T& a, T&& b) { a = kj::mv(b); }) {
-        if (ptr != nullptr) {
-          *ptr = kj::mv(*sourceTemp.ptr);
-        } else {
-          ptr.emplace(kj::mv(*sourceTemp.ptr));
-        }
-      } else {
-        ptr.emplace(kj::mv(*sourceTemp.ptr));
-      }
-    } else {
-      ptr = nullptr;
-    }
+    ptr = kj::mv(sourceTemp.ptr);
     return *this;
   }
 
@@ -1949,20 +2006,8 @@ public:
     requires _::HasConvertingConstructorFlag<T> &&  // Only when MaybeTraits<T> opts in
              requires(U&& u) { T(kj::fwd<U>(u)); }
   Maybe& operator=(U&& value) {
-    if constexpr (requires(T& a, U&& b) { a = kj::fwd<U>(b); }) {
-      if (ptr != nullptr) {
-        *ptr = kj::fwd<U>(value);
-      } else {
-        ptr.emplace(kj::fwd<U>(value));
-      }
-    } else {
-      // T has no assignment from U; fall back to destroy + construct.
-      // Construct a T from the source first for two reasons:
-      // 1. `value` might be inside *this's value.
-      // 2. Exception safety: if construction throws, *this is unchanged.
-      T sourceTemp(kj::fwd<U>(value));
-      ptr.emplace(kj::mv(sourceTemp));
-    }
+    // Delegate to NullableValue::operator=(U&&).
+    ptr = kj::fwd<U>(value);
     return *this;
   }
   // Converting assignment: allows assigning a U that is convertible to T.
